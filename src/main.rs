@@ -50,11 +50,13 @@ struct Arguments {
 // ThreadPool struct to manage threads
 // Taken from: https://doc.rust-lang.org/book/ch20-02-multithreaded.html
 
+// TODO: Add enum for extracting the contents of archive files
 enum Message {
     NewJob(remotefs::fs::File),
     Terminate,
 }
 
+// BucketSearch struct to handle thread/worker creation and pool management
 pub struct BucketSearch {
     workers: Vec<Worker>,
     sender: Arc<Mutex<mpsc::Sender<Message>>>,
@@ -88,22 +90,7 @@ impl BucketSearch {
 
 impl Drop for BucketSearch {
     fn drop(&mut self) {
-        /*if cfg!(debug_assertions) {
-            println!("[+] sending terminate message to all workers");
-        }
-
-        for _ in &self.workers {
-            self.sender.lock().unwrap().send(Message::Terminate).unwrap();
-        }
-
-        if cfg!(debug_assertions) {
-            println!("[+] shutting down all workers")
-        }*/
-
         for worker in &mut self.workers {
-            if cfg!(debug_assertions) {
-                //println!("[+] shutting down worker {}", worker.id);
-            }
 
             if let Some(thread) = worker.thread.take() {
                 thread.join().unwrap();
@@ -121,14 +108,15 @@ struct Worker {
 impl Worker {
     fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Message>>>, sender: Arc<Mutex<mpsc::Sender<Message>>>, bucket_name: String, region: String, access_key: String, secret: String, keywords: Vec<String>) -> Worker {
         let thread = thread::spawn({
-            let sender_clone = sender.clone();
-            let d = Duration::from_secs(10);
+            let d = Duration::from_secs(10); // Timeout value for idle threads
+            // Create a new s3 client
             let mut client = AwsS3Fs::new(bucket_name)
                 .region(region)
                 .profile("default")
                 .access_key(access_key)
                 .secret_access_key(secret);
 
+            // Validate the client connection. Panic if unable to connect
             if client.connect().is_ok() {
                 if cfg!(debug_assertions) {
                     println!("[+] successfully connected with s3 client");
@@ -141,6 +129,7 @@ impl Worker {
                     if cfg!(debug_assertions) {
                         println!("[+] worker {} waiting for new job", id);
                     }
+                    // Wait for a new message from the channel.
                     let message = match receiver.lock().unwrap().recv_timeout(d) {
                         Ok(m) => m,
                         Err(error) => {
@@ -149,19 +138,21 @@ impl Worker {
                         }
                     };
                     match message {
+                        // If the message is for a new directory, add it to the job queue
+                        // TODO: Handle jobs that contain files or directories
                         Message::NewJob(job) => {
                             if cfg!(debug_assertions) {
-                                println!("[+] new job received");
+                                println!("[+] worker {} received new job", id);
                             }
                             let f = job;
                             let results = client.list_dir(f.path()).unwrap();
-
+                            // Iterate through the directory listing
                             for file in results {
                                 if file.borrow().is_file() {
                                     if cfg!(debug_assertions) {
                                         println!("[+] {}", &file.path.to_str().unwrap());
                                     }
-
+                                    // If an entry is a file, iterate through the keyword list and check for a match
                                     for term in &keywords {
                                         let regex_term = regex::escape(&*term);
                                         let regex_str = Regex::new(&*regex_term).unwrap();
@@ -173,11 +164,12 @@ impl Worker {
                                         }
                                     }
                                 }
-
+                                // If an entry is a directory, add it to the job queue
                                 if file.borrow().is_dir() {
                                     if cfg!(debug_assertions) {
                                         println!("[+] {}", &file.path.to_str().unwrap());
                                     }
+                                    let sender_clone = sender.clone();
                                     match sender_clone.lock().unwrap().send(NewJob(file)) {
                                         Ok(_) => {
                                             if cfg!(debug_assertions) {
@@ -188,6 +180,7 @@ impl Worker {
                                             panic!("[!] failed to send new job to queue: {}", error);
                                         }
                                     };
+                                    std::mem::drop(sender_clone.lock().unwrap());
                                 }
                             }
                         }
@@ -209,16 +202,6 @@ impl Worker {
     }
 }
 
-// https://stackoverflow.com/questions/30801031/read-a-file-and-get-an-array-of-strings
-/*
-fn get_search_terms(filename: impl AsRef<Path>) -> Vec<String> {
-    let file = File::open(filename).expect("no such file");
-    let buf = BufReader::new(file);
-    buf.lines()
-        .map(|l| l.expect("Could not parse line"))
-        .collect()
-}*/
-
 #[tokio::main]
 async fn main() {
     // Parse all arguments
@@ -229,20 +212,20 @@ async fn main() {
     let secret = args.aws_secret_key;
     let thread_count = args.threads;
     let keywords : Vec<String> = args.terms.split(",").map(|s| s.to_string()).collect();
-
+    // Print additional info for debug version
     if cfg!(debug_assertions) {
         println!("[+] Targeting bucket: {}", bucket_name);
         println!("[+] Using credentials: {}:{}", access_key, secret);
         println!("[+] Searching for keywords {:?}", keywords);
     }
-
+    // Create a templorary S3 client to validate the credentials and bucket
     let mut client = AwsS3Fs::new(&bucket_name)
         .region(&region_str)
         .profile("default")
         .access_key(&access_key)
         .secret_access_key(&secret);
 
-
+    // Test the client connection
     if client.connect().is_ok() {
         if cfg!(debug_assertions) {
             println!("[+] successfully authenticated and connected to the target bucket");
@@ -252,9 +235,12 @@ async fn main() {
             println!("[!] failed to authenticate and connect to S3 bucket");
         }
     }
-
+    // Create a new BucketSearch object. The constructor sets up the desired number of threads and channel
     let searcher = BucketSearch::new(thread_count.try_into().unwrap(), bucket_name, region_str, access_key, secret, keywords);
+    // List the contents of the root directory in the bucket
     let res = client.list_dir(Path::new("/")).unwrap();
+    // Iterate through the bucket contents
+    // TODO: Pass all file objects to the searcher.execute function
     for item in res {
         if cfg!(debug_assertions) {
             println!("[+] {}", item.path().to_str().unwrap());
@@ -263,6 +249,8 @@ async fn main() {
             searcher.execute(item);
         }
     }
+    // Drop the sender part of the channel so that receivers can obtain the next job
+    std::mem::drop(searcher.sender.lock().unwrap());
     match client.disconnect() {
         Ok(_) => println!("[+] successfully disconnected from s3"),
         Err(error) => println!("[+] error disconnecting from s3: {}", error),
