@@ -42,7 +42,7 @@ struct Arguments {
     #[clap(short, long)]
     deep: bool,
 
-    /// Comma separated list of search terms. e.g. "*password*,credential,*AKIA*,secret"
+    /// Comma separated list of search terms. e.g. "password,credential,AKIA,secret"
     #[clap(long)]
     terms: String
 }
