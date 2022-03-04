@@ -1,46 +1,38 @@
 use std::borrow::Borrow;
-use std::fs::File;
-use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::ffi::OsStr;
+use std::path::{Path};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::thread::{JoinHandle, Thread};
 use std::time::Duration;
+use aws_config::default_provider::credentials::DefaultCredentialsChain;
+use aws_config::meta::region::RegionProviderChain;
+use aws_sdk_s3::model::{Bucket, Object};
+use aws_sdk_s3::{Client, Region};
 use clap::Parser;
-use regex::Regex;
-use remotefs::RemoteFs;
-use remotefs_aws_s3::AwsS3Fs;
+use regex::{Regex, RegexSet};
 use tokio;
-use crate::Message::NewJob;
+use futures::executor::block_on;
+use futures::TryFutureExt;
+use tokio::runtime::Runtime;
+use crate::Message::{NewJobBucket,NewJobObject};
 
 
 // Arguments struct for command line arguments
 
 #[derive(Parser)]
 struct Arguments {
-    /// AWS ACCESS KEY
-    #[clap(long)]
-    aws_access_key_id: String,
-
-    /// AWS SECRET KEY
-    #[clap(long)]
-    aws_secret_key: String,
+    /// Name of the AWS profile to use in ~/.aws/credentials. Default value is "default"
+    #[clap(short, long, default_value = "default")]
+    profile: String,
 
     /// REGION
     #[clap(short, long, default_value = "us-east-1")]
     region: String,
 
-    /// Name of the top level s3 bucket to target for searching
-    #[clap(short, long)]
-    bucket: String,
-
     /// Number of threads to spawn. Default is 10
     #[clap(short, long)]
     threads: i32,
-
-    /// Switch. If true, s3_search will attempt to decompile JAR files, search for keywords and/or credentials in files.
-    #[clap(short, long)]
-    deep: bool,
 
     /// Comma separated list of search terms. e.g. "password,credential,AKIA,secret"
     #[clap(long)]
@@ -52,7 +44,8 @@ struct Arguments {
 
 // TODO: Add enum for extracting the contents of archive files
 enum Message {
-    NewJob(remotefs::fs::File),
+    NewJobBucket(Bucket),
+    NewJobObject(Object),
     Terminate,
 }
 
@@ -63,35 +56,50 @@ pub struct BucketSearch {
 }
 
 impl BucketSearch {
-    pub fn new(size: usize, bucket_name: String, region: String, access_key: String, secret: String, keywords: Vec<String>) -> BucketSearch {
+    pub async fn new(size: usize, region_provider: &RegionProviderChain, profile: String, keywords: Vec<String>) -> BucketSearch {
         assert!(size > 0);
         let mut workers = Vec::with_capacity(size);
         let (sender, receiver) = mpsc::channel();
         let receiver = Arc::new(Mutex::new(receiver));
         let sender = Arc::new(Mutex::new(sender));
+        let region = region_provider.region().await.unwrap();
+
+        let credentials_provider = DefaultCredentialsChain::builder()
+            .region(region)
+            .profile_name(&profile)
+            .build().await;
+
+        let config = aws_config::from_env()
+            .credentials_provider(credentials_provider)
+            .load().await;
+
+        let client = aws_sdk_s3::Client::new(&config);
+        let client = Arc::new(Mutex::new(client));
         for id in 0..size {
             workers.push(
                 Worker::new(id,
                             Arc::clone(&receiver),
                                      Arc::clone(&sender),
-                            bucket_name.to_string(),
-                            region.to_string(),
-                            access_key.to_string(),
-                            secret.to_string(), keywords.to_vec()));
+                            client.clone(),
+                            keywords.to_vec()));
         }
 
         BucketSearch {workers, sender}
     }
 
-    pub fn execute(&self, dir: remotefs::fs::File) {
-        self.sender.lock().unwrap().send(NewJob(dir)).unwrap();
+    pub fn execute(&self, buckets: Vec<&Bucket>) {
+        for bucket in buckets {
+            match self.sender.lock().unwrap().send(NewJobBucket(bucket.clone())) {
+                Ok(_) => {},
+                Err(_) => {},
+            }
+        }
     }
 }
 
 impl Drop for BucketSearch {
     fn drop(&mut self) {
         for worker in &mut self.workers {
-
             if let Some(thread) = worker.thread.take() {
                 thread.join().unwrap();
             }
@@ -106,98 +114,126 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Message>>>, sender: Arc<Mutex<mpsc::Sender<Message>>>, bucket_name: String, region: String, access_key: String, secret: String, keywords: Vec<String>) -> Worker {
-        let thread = thread::spawn({
-            let d = Duration::from_secs(10); // Timeout value for idle threads
-            // Create a new s3 client
-            let mut client = AwsS3Fs::new(bucket_name)
-                .region(region)
-                .profile("default")
-                .access_key(access_key)
-                .secret_access_key(secret);
-
-            // Validate the client connection. Panic if unable to connect
-            if client.connect().is_ok() {
+    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Message>>>, sender: Arc<Mutex<mpsc::Sender<Message>>>, client: Arc<Mutex<Client>>, keywords: Vec<String>) -> Worker {
+        let worker_fn = move || {
+            let d = Duration::from_secs(10);
+            loop {
                 if cfg!(debug_assertions) {
-                    println!("[+] successfully connected with s3 client");
-                } else {
-                    panic!("[!] client failed to connect");
+                    println!("[+] worker {} waiting for new job", id);
                 }
-            }
-            move ||
-                loop {
-                    if cfg!(debug_assertions) {
-                        println!("[+] worker {} waiting for new job", id);
+                // Wait for a new message from the channel.
+                let message = match receiver.lock().unwrap().recv_timeout(d) {
+                    Ok(m) => m,
+                    Err(error) => {
+                        println!("[!] channel timeout for worker {}: {}", id, error);
+                        break;
                     }
-                    // Wait for a new message from the channel.
-                    let message = match receiver.lock().unwrap().recv_timeout(d) {
-                        Ok(m) => m,
-                        Err(error) => {
-                            println!("[!] recv timeout: {}", error);
-                            break;
-                        }
-                    };
-                    match message {
-                        // If the message is for a new directory, add it to the job queue
-                        // TODO: Handle jobs that contain files or directories
-                        Message::NewJob(job) => {
-                            if cfg!(debug_assertions) {
-                                println!("[+] worker {} received new job", id);
-                            }
-                            let f = job;
-                            let results = client.list_dir(f.path()).unwrap();
-                            // Iterate through the directory listing
-                            for file in results {
-                                if file.borrow().is_file() {
-                                    if cfg!(debug_assertions) {
-                                        println!("[+] {}", &file.path.to_str().unwrap());
-                                    }
-                                    // If an entry is a file, iterate through the keyword list and check for a match
-                                    for term in &keywords {
-                                        let regex_term = regex::escape(&*term);
-                                        let regex_str = Regex::new(&*regex_term).unwrap();
-                                        //println!("[+] checking regex: {}", regex_str.as_str());
-                                        if regex_str.is_match(&*file.name()) {
-                                            if cfg!(debug_assertions) {
-                                                println!("[+] {} matched {}", file.name(), &term);
-                                            }
-                                        }
-                                    }
-                                }
-                                // If an entry is a directory, add it to the job queue
-                                if file.borrow().is_dir() {
-                                    if cfg!(debug_assertions) {
-                                        println!("[+] {}", &file.path.to_str().unwrap());
-                                    }
-                                    let sender_clone = sender.clone();
-                                    match sender_clone.lock().unwrap().send(NewJob(file)) {
-                                        Ok(_) => {
-                                            if cfg!(debug_assertions) {
-                                                println!("[+] sent job to queue");
-                                            }
-                                        },
-                                        Err(error) => {
-                                            panic!("[!] failed to send new job to queue: {}", error);
-                                        }
-                                    };
-                                    std::mem::drop(sender_clone.lock().unwrap());
-                                }
-                            }
-                        }
-                        Message::Terminate => {
-                            if cfg!(debug_assertions) {
-                                println!("[+] received terminate message");
-                            }
-                            break;
+                };
+                match message {
+                    // Handle messages from other threads or the main thread
+                    Message::NewJobBucket(bucket) => {
+                        // TODO: Add call to check bucket ACL
+                        // Create the tokio runtime
+                        let rt = match Runtime::new() {
+                            Ok(rt) => rt,
+                            Err(error) => panic!("[!] Unable to create tokio runtime: {}", error),
+                        };
+                        rt.block_on(Self::handle_bucket(keywords.clone(),client.clone(), bucket.clone(), sender.clone()));
+                    }
+                    Message::NewJobObject(obj) => {
+                        // Search the contents of the file for a match
+                        // TODO: Add call to check object ACL
+                        // Create the tokio runtime
+                        let rt = match Runtime::new() {
+                            Ok(rt) => rt,
+                            Err(error) => panic!("[!] Unable to create tokio runtime: {}", error),
+                        };
+                        rt.block_on(Self::handle_object(&keywords, obj, client.clone()));
+                    }
+                    Message::Terminate => {
+                        if cfg!(debug_assertions) {
+                            println!("[+] received terminate message");
                         }
                     }
                 }
             }
-        );
+        };
+        let thread = thread::spawn( worker_fn);
 
         Worker {
             id,
             thread: Some(thread),
+        }
+    }
+
+    async fn handle_bucket(keywords: Vec<String>, client: Arc<Mutex<Client>>, bucket: Bucket, sender: Arc<Mutex<mpsc::Sender<Message>>>) {
+        match client.lock() {
+            Ok(client) => {
+                let resp = match client.list_objects_v2().bucket(bucket.name().unwrap()).send().await {
+                    Ok(resp) => resp,
+                    Err(error) => panic!("unable to obtain objects for bucket: {}", error),
+                };
+
+                for object in resp.contents().unwrap_or_default() {
+                    if !object.key().unwrap().ends_with("/") {
+                        if cfg!(debug_assertions) {
+                            println!("[+] file: {}", object.key().unwrap());
+                        }
+                        Self::keyword_match(&keywords, object.key().unwrap().to_string());
+
+                        // Send the content search job to another thread
+                        match sender.lock().unwrap().send(NewJobObject(object.clone())) {
+                            Ok(_) => {
+                                if cfg!(debug_assertions) {
+                                    println!("[+] sent job to queue");
+                                }
+                            },
+                            Err(error) => {
+                                panic!("[!] failed to send new job to queue: {}", error)
+                            },
+                        };
+                    }
+                }
+            }
+            Err(_) => {},
+        }
+    }
+
+    async fn handle_object(keywords: &Vec<String>, object: Object, client: Arc<Mutex<Client>>) {
+
+        let set = RegexSet::new(&[
+            r".zip",
+            r".tar",
+            r".gz",
+            r".7z",
+            r".bz2",
+            r".tgz",
+            r".tbz2",
+            r".jar",
+        ]).unwrap();
+
+
+        // Create a path object
+        let path = Path::new(object.key().unwrap());
+        match path.extension() {
+            Some(ext) => {
+                // if the file extension matches any of the above extensions
+                if set.is_match(ext.to_str().unwrap()) {
+                    println!("[+] {} match for extension", object.key().unwrap());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn keyword_match(keywords: &Vec<String>, file_path: String) {
+        for term in keywords {
+            let regex_term = regex::escape(&*term);
+            let regex_str = Regex::new(&*regex_term).unwrap();
+            //println!("[+] checking regex: {}", regex_str.as_str());
+            if regex_str.is_match(&*file_path) {
+                println!("[+] term: {} -> name_match: {}", term, file_path);
+            }
         }
     }
 }
@@ -206,53 +242,45 @@ impl Worker {
 async fn main() {
     // Parse all arguments
     let args = Arguments::parse();
-    let bucket_name = args.bucket;
-    let region_str = args.region;
-    let access_key = args.aws_access_key_id;
-    let secret = args.aws_secret_key;
+    let mut region_str: String = args.region;
+    let profile = args.profile;
     let thread_count = args.threads;
     let keywords : Vec<String> = args.terms.split(",").map(|s| s.to_string()).collect();
     // Print additional info for debug version
     if cfg!(debug_assertions) {
-        println!("[+] Targeting bucket: {}", bucket_name);
-        println!("[+] Using credentials: {}:{}", access_key, secret);
         println!("[+] Searching for keywords {:?}", keywords);
     }
-    // Create a templorary S3 client to validate the credentials and bucket
-    let mut client = AwsS3Fs::new(&bucket_name)
-        .region(&region_str)
-        .profile("default")
-        .access_key(&access_key)
-        .secret_access_key(&secret);
 
-    // Test the client connection
-    if client.connect().is_ok() {
-        if cfg!(debug_assertions) {
-            println!("[+] successfully authenticated and connected to the target bucket");
-        }
-    } else {
-        if cfg!(debug_assertions) {
-            println!("[!] failed to authenticate and connect to S3 bucket");
-        }
-    }
-    // Create a new BucketSearch object. The constructor sets up the desired number of threads and channel
-    let searcher = BucketSearch::new(thread_count.try_into().unwrap(), bucket_name, region_str, access_key, secret, keywords);
+    let region_provider = RegionProviderChain::first_try(Region::new(region_str))
+        .or_default_provider();
+
+    let region = region_provider.region().await.unwrap();
+
+    let credentials_provider = DefaultCredentialsChain::builder()
+        .region(region)
+        .profile_name(&profile)
+        .build().await;
+
+    let config = aws_config::from_env()
+        .credentials_provider(credentials_provider)
+        .load().await;
+
+    let mut client = aws_sdk_s3::Client::new(&config);
+
     // List the contents of the root directory in the bucket
-    let res = client.list_dir(Path::new("/")).unwrap();
-    // Iterate through the bucket contents
-    // TODO: Pass all file objects to the searcher.execute function
-    for item in res {
-        if cfg!(debug_assertions) {
-            println!("[+] {}", item.path().to_str().unwrap());
+    match client.list_buckets().send().await {
+        Ok(resp) => {
+            // Create a new BucketSearch object. The constructor sets up the desired number of threads and channel
+            let searcher = BucketSearch::new(thread_count.try_into().unwrap(),region_provider.borrow(), profile, keywords).await;
+            let mut tmp_buckets: Vec<&Bucket> = Vec::new();
+            for bucket in resp.buckets().unwrap() {
+                tmp_buckets.push(&bucket.borrow());
+            }
+            searcher.execute(tmp_buckets);
+            // Drop the sender part of the channel so that receivers can obtain the next job
+            std::mem::drop(searcher.sender.lock().unwrap());
         }
-        if item.is_dir() {
-            searcher.execute(item);
-        }
-    }
-    // Drop the sender part of the channel so that receivers can obtain the next job
-    std::mem::drop(searcher.sender.lock().unwrap());
-    match client.disconnect() {
-        Ok(_) => println!("[+] successfully disconnected from s3"),
-        Err(error) => println!("[+] error disconnecting from s3: {}", error),
+        Err(error) => panic!("[!] Unable to list buckets: {}", error),
     };
+
 }
