@@ -201,7 +201,6 @@ impl Worker {
         let set = RegexSet::new(&[
             r"zip",
             r"tar",
-            r"gz",
             r"7z",
             r"bz2",
             r"tgz",
@@ -214,13 +213,13 @@ impl Worker {
               if cfg!(debug_assertions) {
                   println!("[+] obtained client lock");
               }
-
+              // TODO: Add logic to limit the file size
               match client.get_object().bucket(bucket.name().unwrap()).key(object.key().unwrap()).send().await {
                   Ok(mut obj_contents) => {
-                      let b = obj_contents.body.collect().await.unwrap().into_bytes().to_vec();
-                      if b.len() > 0 {
+                      let raw = obj_contents.body.collect().await.unwrap().into_bytes().to_vec();
+                      if raw.len() > 0 {
                           if cfg!(debug_assertions) {
-                              println!("[+] successfully obtained {} bytes for s3://{}/{}",b.len(),bucket.name().unwrap(),object.key().unwrap());
+                              println!("[+] successfully obtained {} bytes for s3://{}/{}",raw.len(),bucket.name().unwrap(),object.key().unwrap());
                           }
                           // Create a path object
                           let path = Path::new(object.key().unwrap());
@@ -241,11 +240,32 @@ impl Worker {
                                       }
                                   } else {
                                       // TODO: Handle all other extensions
-
+                                      let keyword_set = regex::bytes::RegexSet::new(keywords).unwrap();
+                                      if cfg!(debug_assertions) {
+                                          println!("[+] searching file s3://{}/{}", bucket.name().unwrap(), object.key().unwrap());
+                                      }
+                                      if keyword_set.is_match(&*raw) {
+                                          println!("[+] Found match in s3://{}/{} for patterns {:?}", bucket.name().unwrap(), object.key().unwrap(), keywords);
+                                      } else {
+                                          if cfg!(debug_assertions) {
+                                              println!("[+] no match found in s3://{}/{} for patterns {:?}", bucket.name().unwrap(), object.key().unwrap(), keywords );
+                                          }
+                                      }
                                   }
                               }
-                              _ => {
+                              None => {
                                   // TODO: Handle no extension
+                                  let keyword_set = regex::bytes::RegexSet::new(keywords).unwrap();
+                                  if cfg!(debug_assertions) {
+                                      println!("[+] searching file s3://{}/{}", bucket.name().unwrap(), object.key().unwrap());
+                                  }
+                                  if keyword_set.is_match(&*raw) {
+                                      println!("[+] Found match in s3://{}/{} for patterns {:?}", bucket.name().unwrap(), object.key().unwrap(), keywords);
+                                  } else {
+                                      if cfg!(debug_assertions) {
+                                          println!("[+] no match found in s3://{}/{} for patterns {:?}", bucket.name().unwrap(), object.key().unwrap(), keywords );
+                                      }
+                                  }
                               }
                           };
                       }
