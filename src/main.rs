@@ -1,9 +1,8 @@
-use std::borrow::Borrow;
+use std::borrow::{Borrow, BorrowMut};
 use std::ffi::OsStr;
 use std::path::{Path};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::thread::{JoinHandle, Thread};
 use std::time::Duration;
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_config::meta::region::RegionProviderChain;
@@ -11,9 +10,8 @@ use aws_sdk_s3::model::{Bucket, Object};
 use aws_sdk_s3::{Client, Region};
 use clap::Parser;
 use regex::{Regex, RegexSet};
+use regex::internal::Input;
 use tokio;
-use futures::executor::block_on;
-use futures::TryFutureExt;
 use tokio::runtime::Runtime;
 use crate::Message::{NewJobBucket,NewJobObject};
 
@@ -45,7 +43,7 @@ struct Arguments {
 // TODO: Add enum for extracting the contents of archive files
 enum Message {
     NewJobBucket(Bucket),
-    NewJobObject(Object),
+    NewJobObject((Object, Bucket)),
     Terminate,
 }
 
@@ -118,9 +116,6 @@ impl Worker {
         let worker_fn = move || {
             let d = Duration::from_secs(10);
             loop {
-                if cfg!(debug_assertions) {
-                    println!("[+] worker {} waiting for new job", id);
-                }
                 // Wait for a new message from the channel.
                 let message = match receiver.lock().unwrap().recv_timeout(d) {
                     Ok(m) => m,
@@ -148,12 +143,13 @@ impl Worker {
                             Ok(rt) => rt,
                             Err(error) => panic!("[!] Unable to create tokio runtime: {}", error),
                         };
-                        rt.block_on(Self::handle_object(&keywords, obj, client.clone()));
+                        rt.block_on(Self::handle_object(&keywords, obj.0, obj.1, client.clone()));
                     }
                     Message::Terminate => {
                         if cfg!(debug_assertions) {
                             println!("[+] received terminate message");
                         }
+                        break;
                     }
                 }
             }
@@ -175,14 +171,15 @@ impl Worker {
                 };
 
                 for object in resp.contents().unwrap_or_default() {
+                    // If an object key doesn't end with / or isn't a directory
                     if !object.key().unwrap().ends_with("/") {
                         if cfg!(debug_assertions) {
                             println!("[+] file: {}", object.key().unwrap());
                         }
-                        Self::keyword_match(&keywords, object.key().unwrap().to_string());
+                        Self::keyword_match(&keywords, object.key().unwrap().to_string(), bucket.name().unwrap());
 
                         // Send the content search job to another thread
-                        match sender.lock().unwrap().send(NewJobObject(object.clone())) {
+                        match sender.lock().unwrap().send(NewJobObject((object.clone(), bucket.clone()))) {
                             Ok(_) => {
                                 if cfg!(debug_assertions) {
                                     println!("[+] sent job to queue");
@@ -199,40 +196,81 @@ impl Worker {
         }
     }
 
-    async fn handle_object(keywords: &Vec<String>, object: Object, client: Arc<Mutex<Client>>) {
+    async fn handle_object(keywords: &Vec<String>, object: Object, bucket: Bucket, client: Arc<Mutex<Client>>) {
 
         let set = RegexSet::new(&[
-            r".zip",
-            r".tar",
-            r".gz",
-            r".7z",
-            r".bz2",
-            r".tgz",
-            r".tbz2",
-            r".jar",
+            r"zip",
+            r"tar",
+            r"gz",
+            r"7z",
+            r"bz2",
+            r"tgz",
+            r"tbz2",
+            r"jar",
         ]).unwrap();
 
+        match client.lock() {
+          Ok(client) => {
+              if cfg!(debug_assertions) {
+                  println!("[+] obtained client lock");
+              }
 
-        // Create a path object
-        let path = Path::new(object.key().unwrap());
-        match path.extension() {
-            Some(ext) => {
-                // if the file extension matches any of the above extensions
-                if set.is_match(ext.to_str().unwrap()) {
-                    println!("[+] {} match for extension", object.key().unwrap());
-                }
+              match client.get_object().bucket(bucket.name().unwrap()).key(object.key().unwrap()).send().await {
+                  Ok(mut obj_contents) => {
+                      let b = obj_contents.body.collect().await.unwrap().into_bytes().to_vec();
+                      if b.len() > 0 {
+                          if cfg!(debug_assertions) {
+                              println!("[+] successfully obtained {} bytes for s3://{}/{}",b.len(),bucket.name().unwrap(),object.key().unwrap());
+                          }
+                          // Create a path object
+                          let path = Path::new(object.key().unwrap());
+                          match path.extension() {
+                              Some(ext) => {
+                                  // If the path has an extension that matches our regex set
+                                  if set.is_match(ext.to_str().unwrap()) {
+                                      // Extract the contents of the archive
+                                      match ext.to_str().unwrap() {
+                                          "zip" => {
+                                              // Unzip zip archive and search through each file
+                                              // TODO: Handle zip archives
+                                          },
+                                          "jar" => {
+                                              // TODO: Handle jar files
+                                          },
+                                          _ => {}
+                                      }
+                                  } else {
+                                      // TODO: Handle all other extensions
+
+                                  }
+                              }
+                              _ => {
+                                  // TODO: Handle no extension
+                              }
+                          };
+                      }
+
+                  }
+                  Err(error) => {
+                      if cfg!(debug_assertions) {
+                          println!("[+] unable to get object contents: {}", error);
+                      }
+                  }
+              }
+          },
+            Err(error) => {
+                println!("[!] unable to obtain mutex lock: {}", error);
             }
-            _ => {}
-        }
+        };
     }
 
-    fn keyword_match(keywords: &Vec<String>, file_path: String) {
+    fn keyword_match(keywords: &Vec<String>, file_path: String, bucket_name: &str) {
         for term in keywords {
             let regex_term = regex::escape(&*term);
             let regex_str = Regex::new(&*regex_term).unwrap();
             //println!("[+] checking regex: {}", regex_str.as_str());
             if regex_str.is_match(&*file_path) {
-                println!("[+] term: {} -> name_match: {}", term, file_path);
+                println!("[+] term: {} -> name_match: s3://{}/{}", term, bucket_name, file_path);
             }
         }
     }
