@@ -10,6 +10,10 @@ tokio = { version = "1", features = ["full"] }
 futures = "0.3.21"
 clap = { version = "3.0", features = ["derive"] }
 regex = "1.5.4"
+grep-searcher = "0.1.8"
+grep-matcher = "0.1.5"
+tempfile = "3.3.0"
+grep-regex = "0.1.9"
 simple-logging = "2.0.2"
 log = "0.4.14"
 tar = "0.4.38"
