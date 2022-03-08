@@ -38,11 +38,11 @@ struct Arguments {
     #[clap(short, long)]
     threads: i32,
 
-    /// Comma separated list of search terms. e.g. "password,credential,AKIA,secret"
+    /// Space delimited list of search terms. e.g. "password credential AKIA secret"
     #[clap(long)]
     terms: String,
 
-    /// Comma separated list of file extensions that should be excluded from file content searches. e.g. "pdf,docx,txt,tfstate"
+    /// Space delimited list of file extensions that should be excluded from file content searches. e.g. "pdf docx txt tfstate"
     #[clap(short, long)]
     excludelist: String,
 
@@ -270,6 +270,7 @@ impl Worker {
                                                                           },
                                                                       };
                                                                       // Iterate through all of the files in the ZIP archive
+                                                                      // https://github.com/zip-rs/zip/blob/master/examples/extract.rs
                                                                       for i in 0..archive.len() {
                                                                           let mut file = archive.by_index(i).unwrap();
                                                                           if file.is_file() {
@@ -340,9 +341,15 @@ impl Worker {
     }
 
     fn byte_search(keywords: &Vec<String>, file_path: String, bucket_name: &str, content: Vec<u8>) {
+        // Escape regex characters in keywords
+        let mut escaped_keywords = vec![];
+        for word in keywords {
+            let escaped = regex::escape(word);
+            escaped_keywords.push(escaped);
+        }
         // Iterate through all search terms and search for byte patterns that match any term
-        for pattern in keywords {
-            let matcher = RegexMatcher::new(pattern).unwrap();
+        for pattern in escaped_keywords {
+            let matcher = RegexMatcher::new(pattern.as_str()).unwrap();
             let mut matches: Vec<(u64, String)> = vec![];
             let res = Searcher::new().search_slice(&matcher, &*content, UTF8(|lnum, line| {
                 let mymatch = matcher.find(line.as_ref())?.unwrap();
@@ -362,10 +369,16 @@ impl Worker {
     }
 
     fn keyword_match(keywords: &Vec<String>, file_path: String, bucket_name: &str) {
+        // Escape regex characters in keywords
+        let mut escaped_keywords = vec![];
+        for word in keywords {
+            let escaped = regex::escape(word);
+            escaped_keywords.push(escaped);
+        }
         // Find matches in the object key for any term in the RegexSet
-        let set = RegexSet::new(keywords).unwrap();
+        let set = RegexSet::new(escaped_keywords).unwrap();
         if set.is_match(&*file_path) {
-            println!("[+] terms: {:#?} -> name_match: s3://{}/{}", set, bucket_name, file_path);
+            println!("[+] terms: {:#?} -> name_match: s3://{}/{}", set.patterns(), bucket_name, file_path);
         }
     }
 }
@@ -379,8 +392,8 @@ async fn main() {
     let thread_count = args.threads;
     let max_size: i64 = args.maxsize;
     let verbose: bool = args.verbose;
-    let keywords : Vec<String> = args.terms.split(",").map(|s| s.to_string()).collect();
-    let exclude: Vec<String> = args.excludelist.split(",").map(|s| s.to_string()).collect();
+    let keywords : Vec<String> = args.terms.split(" ").map(|s| s.to_string()).collect();
+    let exclude: Vec<String> = args.excludelist.split(" ").map(|s| s.to_string()).collect();
     // Print additional info for debug version
     if cfg!(debug_assertions) {
         println!("[+] Searching for keywords {:?}", keywords);
