@@ -13,16 +13,16 @@ USAGE:
     s3_search [OPTIONS] --threads <THREADS> --terms <TERMS> --excludelist <EXCLUDELIST>
 
 OPTIONS:
-    -e, --excludelist <EXCLUDELIST>    Comma separated list of file extensions that should be
-                                       excluded from file content searches. e.g.
-                                       "pdf,docx,txt,tfstate"
+    -e, --excludelist <EXCLUDELIST>    Space delimited list of file extensions that should be
+                                       excluded from file content searches. e.g. "pdf docx txt
+                                       tfstate"
     -h, --help                         Print help information
     -m, --maxsize <MAXSIZE>            Max file size in bytes. Default is 1048576 [default: 1048576]
     -p, --profile <PROFILE>            Name of the AWS profile to use in ~/.aws/credentials. Default
                                        value is "default" [default: default]
     -r, --region <REGION>              REGION [default: us-east-1]
     -t, --threads <THREADS>            Number of threads to spawn
-        --terms <TERMS>                Comma separated list of search terms. e.g.
-                                       "password,credential,AKIA,secret"
+        --terms <TERMS>                Space delimited list of search terms. e.g. "password
+                                       credential AKIA secret"
     -v, --verbose                      Print verbose output```
 

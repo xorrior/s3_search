@@ -38,7 +38,7 @@ struct Arguments {
     #[clap(short, long)]
     threads: i32,
 
-    /// Space delimited list of search terms. e.g. "password credential AKIA secret"
+    /// Space delimited list of search terms. e.g. "password credential AKIA secret "
     #[clap(long)]
     terms: String,
 
