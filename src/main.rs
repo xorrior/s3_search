@@ -341,45 +341,53 @@ impl Worker {
     }
 
     fn byte_search(keywords: &Vec<String>, file_path: String, bucket_name: &str, content: Vec<u8>) {
-        // Escape regex characters in keywords
-        let mut escaped_keywords = vec![];
-        for word in keywords {
-            let escaped = regex::escape(word);
-            escaped_keywords.push(escaped);
-        }
         // Iterate through all search terms and search for byte patterns that match any term
-        for pattern in escaped_keywords {
-            let matcher = RegexMatcher::new(pattern.as_str()).unwrap();
-            let mut matches: Vec<(u64, String)> = vec![];
-            let res = Searcher::new().search_slice(&matcher, &*content, UTF8(|lnum, line| {
-                let mymatch = matcher.find(line.as_ref())?.unwrap();
-                matches.push((lnum, line[mymatch].to_string()));
-                Ok(true)
-            }));
+        for pattern in keywords {
+            match RegexMatcher::new(pattern.as_str()) {
+                Ok(matcher) => {
+                    let mut matches: Vec<(u64, String)> = vec![];
+                    let res = Searcher::new().search_slice(&matcher, &*content, UTF8(|lnum, line| {
+                        match matcher.find(line.as_ref()) {
+                            Ok(r) => {
+                                match r {
+                                    Some(m) => {
+                                        matches.push((lnum, line[m].to_string()));
+                                    }
+                                    None => {}
+                                }
+                            },
+                            Err(_) => {}
+                        };
 
-            match res {
-                Err(error) => println!("[!] byte pattern search failed: {}", error),
-                Ok(_) => {
-                    if matches.len() > 0 {
-                        println!("[+] matches for s3://{}/{}: {:#?}", bucket_name, file_path,matches);
+                        Ok(true)
+                    }));
+
+                    match res {
+                        Err(error) => println!("[!] byte pattern search failed: {}", error),
+                        Ok(_) => {
+                            if matches.len() > 0 {
+                                println!("[+] patterns: {:#?} -> content_match for s3://{}/{}", matches, bucket_name, file_path);
+                            }
+                        }
                     }
-                }
-            }
+                },
+                Err(error) => println!("[!] error creating matcher: {}", error)
+            };
+
         }
     }
 
     fn keyword_match(keywords: &Vec<String>, file_path: String, bucket_name: &str) {
-        // Escape regex characters in keywords
-        let mut escaped_keywords = vec![];
-        for word in keywords {
-            let escaped = regex::escape(word);
-            escaped_keywords.push(escaped);
-        }
         // Find matches in the object key for any term in the RegexSet
-        let set = RegexSet::new(escaped_keywords).unwrap();
-        if set.is_match(&*file_path) {
-            println!("[+] terms: {:#?} -> name_match: s3://{}/{}", set.patterns(), bucket_name, file_path);
-        }
+        match RegexSet::new(keywords) {
+            Ok(set) => {
+                if set.is_match(&*file_path) {
+                    println!("[+] terms: {:#?} -> name_match: s3://{}/{}", set.patterns(), bucket_name, file_path);
+                }
+            },
+            Err(error) => println!("[!] error creating regex set: {}", error),
+        };
+
     }
 }
 
