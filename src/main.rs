@@ -34,7 +34,7 @@ struct Arguments {
     #[clap(short, long, default_value = "us-east-1")]
     region: String,
 
-    /// Number of threads to spawn. Default is 10
+    /// Number of threads to spawn.
     #[clap(short, long)]
     threads: i32,
 
@@ -42,8 +42,8 @@ struct Arguments {
     #[clap(long)]
     terms: String,
 
-    /// Comma separated list of file types that should be excluded from content searching
-    #[clap(long)]
+    /// Comma separated list of file extensions that should be excluded from file content searches. e.g. "pdf,docx,txt,tfstate"
+    #[clap(short, long)]
     excludelist: String,
 
     /// Max file size in bytes. Default is 1048576
@@ -252,7 +252,6 @@ impl Worker {
                                                       match ext.to_str().unwrap() {
                                                           "zip" => {
                                                               // Unzip zip archive and search through each file
-                                                              // TODO: Handle zip archives
                                                               // Create a tmp file to save the raw contents
                                                               let mut tmp_file = tempfile().unwrap();
                                                               // Write the contents to the tmp file
