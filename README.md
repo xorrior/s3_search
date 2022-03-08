@@ -24,5 +24,5 @@ OPTIONS:
     -t, --threads <THREADS>            Number of threads to spawn
         --terms <TERMS>                Space delimited list of search terms. e.g. "password
                                        credential AKIA secret"
-    -v, --verbose                      Print verbose output```
+    -v, --verbose                      Print verbose output
 
