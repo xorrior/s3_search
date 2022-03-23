@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_config::meta::region::RegionProviderChain;
-use aws_sdk_s3::model::{Bucket, Object};
+use aws_sdk_s3::model::{Bucket, grant, Object};
 use aws_sdk_s3::{Client, Region};
 use clap::Parser;
 use regex::{Regex, RegexSet};
@@ -146,7 +146,6 @@ impl Worker {
                 match message {
                     // Handle messages from other threads or the main thread
                     Message::NewJobBucket(bucket) => {
-                        // TODO: Add call to check bucket ACL
                         // Create the tokio runtime
                         let rt = match Runtime::new() {
                             Ok(rt) => rt,
@@ -156,7 +155,6 @@ impl Worker {
                     }
                     Message::NewJobObject(obj) => {
                         // Search the contents of the file for a match
-                        // TODO: Add call to check object ACL
                         // Create the tokio runtime
                         let rt = match Runtime::new() {
                             Ok(rt) => rt,
@@ -193,7 +191,7 @@ impl Worker {
                 for object in resp.contents().unwrap_or_default() {
                     // If an object key doesn't end with / or isn't a directory
                     if !object.key().unwrap().ends_with("/") {
-                        Self::keyword_match(&keywords, object.key().unwrap().to_string(), bucket.name().unwrap());
+                        Self::filename_match(&keywords, object.key().unwrap().to_string(), bucket.name().unwrap());
 
                         // Send the content search job to another thread
                         match sender.lock().unwrap().send(NewJobObject((object.clone(), bucket.clone()))) {
@@ -218,14 +216,13 @@ impl Worker {
             //r"bz2",
             //r"tgz",
             //r"tbz2",
-            r"jar",
+            //r"jar",
         ]).unwrap();
 
         let exclude_set = RegexSet::new(exclude_list).unwrap();
         // Obtain a lock on the client before use
         match client.lock() {
           Ok(client) => {
-              // TODO: Add logic to limit the file size
               match client.head_object().bucket(bucket.name().unwrap()).key(object.key().unwrap()).send().await {
                   Ok(obj_metadata) => {
                       if obj_metadata.content_length <= max_file_size {
@@ -233,12 +230,13 @@ impl Worker {
                           match path.extension() {
                               Some(ext) => {
                                   if exclude_set.is_match(ext.to_str().unwrap()) {
+                                      // Return if the file is more than the max_file_size
                                      return;
                                   }
                               },
                               None => {},
                           }
-                          // Return if the file is more than the max_file_size
+
                           match client.get_object().bucket(bucket.name().unwrap()).key(object.key().unwrap()).send().await {
                               Ok(mut obj_contents) => {
                                   if obj_contents.content_length < max_file_size {
@@ -274,7 +272,7 @@ impl Worker {
                                                                       for i in 0..archive.len() {
                                                                           let mut file = archive.by_index(i).unwrap();
                                                                           if file.is_file() {
-                                                                              Self::keyword_match(&keywords, file.enclosed_name().unwrap().to_str().unwrap().to_string(), format!("{}/{}", bucket.name().unwrap(), object.key().unwrap()).as_str());
+                                                                              Self::filename_match(&keywords, file.enclosed_name().unwrap().to_str().unwrap().to_string(), format!("{}/{}", bucket.name().unwrap(), object.key().unwrap()).as_str());
                                                                               // Extract the contents
                                                                               let mut tmp_contents= Vec::new();
 
@@ -377,7 +375,7 @@ impl Worker {
         }
     }
 
-    fn keyword_match(keywords: &Vec<String>, file_path: String, bucket_name: &str) {
+    fn filename_match(keywords: &Vec<String>, file_path: String, bucket_name: &str) {
         // Find matches in the object key for any term in the RegexSet
         match RegexSet::new(keywords) {
             Ok(set) => {
@@ -425,7 +423,7 @@ async fn main() {
         .load().await;
 
     // Create a new client
-    let mut client = aws_sdk_s3::Client::new(&config);
+    let client = aws_sdk_s3::Client::new(&config);
 
     // List all buckets and send the results to the BucketSearch class
     match client.list_buckets().send().await {
@@ -434,6 +432,16 @@ async fn main() {
             let searcher = BucketSearch::new(thread_count.try_into().unwrap(),region_provider.borrow(), profile, keywords, exclude,max_size).await;
             let mut tmp_buckets: Vec<&Bucket> = Vec::new();
             for bucket in resp.buckets().unwrap() {
+                /*match client.get_bucket_acl().bucket(bucket.name().unwrap()).send().await {
+                    Ok(acl) => {
+                        for grant in acl.grants().unwrap() {
+                            println!("[+] grantee: {}", grant.clone().grantee().unwrap().email_address().unwrap());
+                            println!("[+] permission: {}", grant.clone().permission().unwrap().as_str());
+                        }
+                    },
+                    Err(_) => {}
+                };*/
+
                 tmp_buckets.push(&bucket.borrow());
             }
             searcher.execute(tmp_buckets);
