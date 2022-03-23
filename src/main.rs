@@ -432,15 +432,6 @@ async fn main() {
             let searcher = BucketSearch::new(thread_count.try_into().unwrap(),region_provider.borrow(), profile, keywords, exclude,max_size).await;
             let mut tmp_buckets: Vec<&Bucket> = Vec::new();
             for bucket in resp.buckets().unwrap() {
-                /*match client.get_bucket_acl().bucket(bucket.name().unwrap()).send().await {
-                    Ok(acl) => {
-                        for grant in acl.grants().unwrap() {
-                            println!("[+] grantee: {}", grant.clone().grantee().unwrap().email_address().unwrap());
-                            println!("[+] permission: {}", grant.clone().permission().unwrap().as_str());
-                        }
-                    },
-                    Err(_) => {}
-                };*/
 
                 tmp_buckets.push(&bucket.borrow());
             }
